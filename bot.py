@@ -853,8 +853,11 @@ async def handle_login_step(event, uid: int, text: str):
             st["hash"] = code_hash
             st["step"] = "code"
             await event.respond(
-                "💬 Код отправлен. Введите его, <b>разделяя цифры пробелами</b> "
-                "(например <code>1 2 3 4 5</code>) — так Telegram не сбросит код.\n\n"
+                "💬 Код отправлен.\n\n"
+                "⚠️ <b>Важно:</b> если ввести код как есть, Telegram сразу его "
+                "сбросит (код ушёл через чат). Введите цифры <b>через пробел или дефис</b>:\n"
+                "<code>1 2 3 4 5</code> или <code>1-2-3-4-5</code>\n\n"
+                "Надёжнее войти на сервере командой <code>python login.py</code>.\n\n"
                 "/cancel — отмена"
             )
         except Exception as exc:  # noqa: BLE001
@@ -881,7 +884,16 @@ async def handle_login_step(event, uid: int, text: str):
             await event.respond("🔒 Включена двухфакторная защита. Введите пароль (2FA):")
             return
         except PhoneCodeInvalidError:
-            await event.respond("Неверный код. Попробуйте ещё раз:")
+            await event.respond(
+                "Неверный или уже сброшенный код.\n\n"
+                "Telegram часто аннулирует код, если его отправили в чат бота.\n"
+                "1) Нажмите /cancel и войдите заново, введя код как "
+                "<code>1 2 3 4 5</code>\n"
+                "2) Либо на сервере:\n"
+                "<code>sudo systemctl stop workparser</code>\n"
+                "<code>cd /opt/WorkParserBot && source venv/bin/activate && python login.py</code>"
+            )
+            LOGIN.pop(uid, None)
             return
         except PhoneCodeExpiredError:
             LOGIN.pop(uid, None)
