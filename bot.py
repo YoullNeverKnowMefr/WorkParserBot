@@ -830,13 +830,27 @@ async def handle_login_step(event, uid: int, text: str):
     step = st["step"]
 
     if step == "phone":
-        phone = text.replace(" ", "")
+        phone = text.replace(" ", "").strip()
+        if not phone.startswith("+"):
+            await event.respond(
+                "Номер должен быть в международном формате, например "
+                "<code>+79991234567</code>. Попробуйте ещё раз:"
+            )
+            return
         st["phone"] = phone
         try:
             if not user.is_connected():
                 await user.connect()
             sent = await user.send_code_request(phone)
-            st["hash"] = sent.phone_code_hash
+            code_hash = getattr(sent, "phone_code_hash", None)
+            if not code_hash:
+                LOGIN.pop(uid, None)
+                await event.respond(
+                    "Telegram не вернул phone_code_hash. Попробуйте снова или "
+                    "войдите через консоль: <code>python login.py</code>"
+                )
+                return
+            st["hash"] = code_hash
             st["step"] = "code"
             await event.respond(
                 "💬 Код отправлен. Введите его, <b>разделяя цифры пробелами</b> "
@@ -850,8 +864,18 @@ async def handle_login_step(event, uid: int, text: str):
 
     if step == "code":
         code = re.sub(r"\D", "", text)
+        code_hash = st.get("hash")
+        phone = st.get("phone")
+        if not code or not phone or not code_hash:
+            LOGIN.pop(uid, None)
+            await event.respond(
+                "Сессия входа сброшена (нет phone_code_hash). "
+                "Нажмите 🔑 Войти заново или выполните на сервере:\n"
+                "<code>python login.py</code>"
+            )
+            return
         try:
-            await user.sign_in(phone=st["phone"], code=code, phone_code_hash=st["hash"])
+            await user.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
         except SessionPasswordNeededError:
             st["step"] = "password"
             await event.respond("🔒 Включена двухфакторная защита. Введите пароль (2FA):")
