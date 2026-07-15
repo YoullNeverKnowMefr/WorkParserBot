@@ -7,11 +7,31 @@
         "channels": [
           {
             "label": "GameDev Вакансии",
-            "channel": "-1003926490628",
+            "channel": "-1001982447492",
             "copy_media": false,
             "subcategories": [
-              { "label": "Unity",  "tags": ["#unity", "#вакансия"],  "image": "images/unity.jpg" },
-              { "label": "Unreal", "tags": ["#unreal", "#вакансия"], "image": "images/unreal.jpg" }
+              {
+                "label": "Unity",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/unity.jpg"
+              },
+              {
+                "label": "Unreal",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/unreal.jpg"
+              }
             ]
           }
         ]
@@ -21,23 +41,53 @@
         "channels": [
           {
             "label": "айтишка",
-            "channel": "-1003926490628",
+            "channel": "-1001530399130",
             "copy_media": false,
             "subcategories": [
-              { "label": "вид поста 1", "tags": ["#backend", "#вакансия"], "image": "images/backend.jpg" }
-            ]
-          }
-        ]
-      },
-      {
-        "label": "Работа в GameDev",
-        "channels": [
-          {
-            "label": "Работа в GameDev",
-            "channel": "-1003926490628",
-            "copy_media": false,
-            "subcategories": [
-              { "label": "вид поста 1", "tags": ["#backend", "#вакансия"], "image": "images/backend.jpg" }
+              {
+                "label": "Unity",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/unity.jpg"
+              },
+              {
+                "label": "Unreal",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/unreal.jpg"
+              },
+              {
+                "label": "Backend",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/backend.jpg"
+              },
+              {
+                "label": "Design",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/design.jpg"
+              }
             ]
           }
         ]
@@ -47,10 +97,53 @@
         "channels": [
           {
             "label": "it работа для джунов",
-            "channel": "-1003926490628",
+            "channel": "-1001871939055",
             "copy_media": false,
             "subcategories": [
-              { "label": "вид поста 1", "tags": ["#junior", "#вакансия"], "image": "images/backend.jpg" }
+              {
+                "label": "Unity",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/junior.jpg"
+              },
+              {
+                "label": "Unreal",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/junior.jpg"
+              },
+              {
+                "label": "Backend",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/junior.jpg"
+              },
+              {
+                "label": "Design",
+                "tags": [],
+                "links": [
+                  { "text": "🎮Работа в GameDev", "url": "https://t.me/DevZoneGD" },
+                  { "text": "🟢Junior", "url": "https://t.me/DevZoneJunior" },
+                  { "text": "👨‍💻IT Portal", "url": "https://t.me/DevZoneST" },
+                  { "text": "🟢Отправить резюме", "url": "https://t.me/DevZoneCV/23" }
+                ],
+                "image": "images/junior.jpg"
+              }
             ]
           }
         ]
@@ -65,30 +158,53 @@
         "channels": [
           {
             "label": "Взрослый",
-            "channel": "-1004292958160",
+            "channel": "-1001611166528",
             "copy_media": true,
             "subcategories": [
               {
                 "label": "вид поста 1",
-                "tags": ["#design", "#вакансия"],
+                "tags": [],
+                "links": [
+                  { "text": "🐟 Ростовский Ёрш", "url": "https://t.me/rndfish" },
+                  { "text": "📅 Афиша Ростова", "url": "https://t.me/RndEvent" },
+                  { "text": "🍰 Детская Афиша", "url": "https://t.me/kidsrnd" }
+                ],
                 "image": "images/design.jpg"
               }
             ]
           },
           {
             "label": "Детский",
-            "channel": "-1004292958160",
+            "channel": "-1001708247442",
             "copy_media": true,
             "subcategories": [
-              { "label": "вид поста 1", "tags": ["#design", "#вакансия"], "image": "images/design.jpg" }
+              {
+                "label": "вид поста 1",
+                "tags": [],
+                "links": [
+                  { "text": "🐟 Ростовский Ёрш", "url": "https://t.me/rndfish" },
+                  { "text": "📅 Афиша Ростова", "url": "https://t.me/RndEvent" },
+                  { "text": "🍰 Детская Афиша", "url": "https://t.me/kidsrnd" }
+                ],
+                "image": "images/design.jpg"
+              }
             ]
           },
           {
             "label": "ростовский еж",
-            "channel": "-1004292958160",
+            "channel": "-1002126476842",
             "copy_media": true,
             "subcategories": [
-              { "label": "вид поста 1", "tags": ["#design", "#вакансия"], "image": "images/design.jpg" }
+              {
+                "label": "вид поста 1",
+                "tags": [],
+                "links": [
+                  { "text": "🐟 Ростовский Ёрш", "url": "https://t.me/rndfish" },
+                  { "text": "📅 Афиша Ростова", "url": "https://t.me/RndEvent" },
+                  { "text": "🍰 Детская Афиша", "url": "https://t.me/kidsrnd" }
+                ],
+                "image": "images/design.jpg"
+              }
             ]
           }
         ]
@@ -98,14 +214,14 @@
         "channels": [
           {
             "label": "Новости Ереван",
-            "channel": "-1004384420833",
+            "channel": "-1001774095798",
             "copy_media": true,
             "subcategories": [
               {
                 "label": "вид поста 1",
                 "tags": [],
                 "links": [
-                  { "text": "Афиша Ереван", "url": "https://t.me/ErevanRus" }
+                  { "text": "Афиша Ереван✅", "url": "https://t.me/ErevanRus" }
                 ],
                 "image": "images/design.jpg"
               }
