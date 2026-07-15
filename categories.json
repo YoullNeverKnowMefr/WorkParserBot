@@ -1,0 +1,118 @@
+[
+  {
+    "label": "🎮 GameDev",
+    "branches": [
+      {
+        "label": "Вакансии",
+        "channels": [
+          {
+            "label": "GameDev Вакансии",
+            "channel": "-1003926490628",
+            "copy_media": false,
+            "subcategories": [
+              { "label": "Unity",  "tags": ["#unity", "#вакансия"],  "image": "images/unity.jpg" },
+              { "label": "Unreal", "tags": ["#unreal", "#вакансия"], "image": "images/unreal.jpg" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "айтишка",
+        "channels": [
+          {
+            "label": "айтишка",
+            "channel": "-1003926490628",
+            "copy_media": false,
+            "subcategories": [
+              { "label": "вид поста 1", "tags": ["#backend", "#вакансия"], "image": "images/backend.jpg" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "Работа в GameDev",
+        "channels": [
+          {
+            "label": "Работа в GameDev",
+            "channel": "-1003926490628",
+            "copy_media": false,
+            "subcategories": [
+              { "label": "вид поста 1", "tags": ["#backend", "#вакансия"], "image": "images/backend.jpg" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "it работа для джунов",
+        "channels": [
+          {
+            "label": "it работа для джунов",
+            "channel": "-1003926490628",
+            "copy_media": false,
+            "subcategories": [
+              { "label": "вид поста 1", "tags": ["#junior", "#вакансия"], "image": "images/backend.jpg" }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "label": "Новостники",
+    "branches": [
+      {
+        "label": "Ростов",
+        "channels": [
+          {
+            "label": "Взрослый",
+            "channel": "-1004292958160",
+            "copy_media": true,
+            "subcategories": [
+              {
+                "label": "вид поста 1",
+                "tags": ["#design", "#вакансия"],
+                "image": "images/design.jpg"
+              }
+            ]
+          },
+          {
+            "label": "Детский",
+            "channel": "-1004292958160",
+            "copy_media": true,
+            "subcategories": [
+              { "label": "вид поста 1", "tags": ["#design", "#вакансия"], "image": "images/design.jpg" }
+            ]
+          },
+          {
+            "label": "ростовский еж",
+            "channel": "-1004292958160",
+            "copy_media": true,
+            "subcategories": [
+              { "label": "вид поста 1", "tags": ["#design", "#вакансия"], "image": "images/design.jpg" }
+            ]
+          }
+        ]
+      },
+      {
+        "label": "Ереван",
+        "channels": [
+          {
+            "label": "Новости Ереван",
+            "channel": "-1004384420833",
+            "copy_media": true,
+            "subcategories": [
+              {
+                "label": "вид поста 1",
+                "tags": [],
+                "links": [
+                  { "text": "Афиша Ереван", "url": "https://t.me/ErevanRus" }
+                ],
+                "image": "images/design.jpg"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]
