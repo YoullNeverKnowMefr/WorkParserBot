@@ -183,6 +183,89 @@ def strip_hashtags(text: str) -> str:
 
 _BULLET_RE = re.compile(r"^\s*[—–\-•*●▪‣·◦▸►]\s*")
 _TME_RE = re.compile(r"(https?://)?t\.me/\S+", re.IGNORECASE)
+_HREF_RE = re.compile(r"""href=["'][^"']+["']""", re.IGNORECASE)
+# Trailing channel signature: "@Name", "➡️@Name", "🔗 @Name" etc.
+_AT_SIGNATURE_RE = re.compile(
+    r"^(?:[\s\W_]|[➡️🔗📢👉✨⭐️⭐⭐]*|️)*@[\w\d_]{3,}(?:[\s\W_]|[➡️🔗📢👉✨⭐️⭐]*|️)*$",
+    re.UNICODE,
+)
+# @channel stuck to the end of the last content line / HTML chunk.
+_TRAILING_AT_RE = re.compile(
+    r"(?:<br\s*/?>|\s|&nbsp;)*"
+    r"(?:<a\b[^>]*>)?@"
+    r"[\w\d_]{3,}"
+    r"(?:</a>)?"
+    r"\s*$",
+    re.IGNORECASE,
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _plain(line: str) -> str:
+    return _TAG_RE.sub("", line).replace("&nbsp;", " ").strip()
+
+
+def _is_footer_line(line: str) -> bool:
+    """True for empty / promo / source-link / @channel signature lines."""
+    plain = _plain(line)
+    if not plain:
+        return True
+    low = line.lower()
+    if _TME_RE.search(plain) or _TME_RE.search(line):
+        return True
+    if "t.me/" in low or ("http" in low and _HREF_RE.search(line) and len(plain) < 120):
+        return True
+    if _AT_SIGNATURE_RE.match(plain):
+        return True
+    # Short line that is only a hyperlink label (common promo footer).
+    if len(plain) <= 60 and _HREF_RE.search(line) and plain.count(" ") <= 6:
+        return True
+    return False
+
+
+def strip_source_footer(text: str) -> str:
+    """Drop the source channel's trailing promo block (links, @mentions, signatures).
+
+    Removes trailing footer lines and a trailing @channel stuck to the last
+    content line, so source links do not leak into the republished post.
+    """
+    if not text:
+        return ""
+    lines = [ln.rstrip() for ln in text.splitlines()]
+
+    # 1) Drop trailing footer-like lines (and blank lines among them).
+    while lines and _is_footer_line(lines[-1]):
+        lines.pop()
+
+    # 2) If the last paragraph (after a blank line) is entirely footer-like — drop it.
+    while True:
+        # Find last blank separator
+        sep = None
+        for i in range(len(lines) - 1, -1, -1):
+            if not lines[i].strip():
+                sep = i
+                break
+        if sep is None:
+            break
+        tail = [ln for ln in lines[sep + 1 :] if ln.strip()]
+        if tail and all(_is_footer_line(ln) for ln in tail):
+            lines = lines[:sep]
+            while lines and not lines[-1].strip():
+                lines.pop()
+            continue
+        break
+
+    if not lines:
+        return ""
+
+    # 3) Strip trailing @channel on the last content line.
+    lines[-1] = _TRAILING_AT_RE.sub("", lines[-1]).rstrip()
+    while lines and not lines[-1].strip():
+        lines.pop()
+
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
 
 
 def _is_section_header(line: str) -> bool:
@@ -193,10 +276,8 @@ def _is_section_header(line: str) -> bool:
 def format_post(text: str) -> str:
     """Reformat a vacancy into a consistent look and return HTML."""
     text = strip_hashtags(text)
+    text = strip_source_footer(text)
     lines = [ln.rstrip() for ln in text.splitlines()]
-
-    while lines and (not lines[-1].strip() or _TME_RE.search(lines[-1])):
-        lines.pop()
 
     out: list[str] = []
     for ln in lines:
@@ -906,7 +987,7 @@ async def _publish(
     if config.AUTO_FORMAT:
         body = format_post(raw_html)
     else:
-        body = strip_hashtags(raw_html)
+        body = strip_source_footer(strip_hashtags(raw_html))
 
     footer_parts = []
     tag_line = " ".join(target["tags"])
