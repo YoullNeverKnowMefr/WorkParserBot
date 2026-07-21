@@ -1,23 +1,17 @@
-"""Vacancy moderation userbot with an in-chat control panel.
+"""Vacancy / event moderation bot — no user account required.
 
-Two clients run in one process:
-  * user  - the observer account. Monitors SOURCE_CHANNELS and publishes to TARGET_CHANNEL.
-  * bot   - a BotFather bot. Renders inline keyboards (category approval + control panel).
+Architecture:
+  * Scrapes public Telegram channels via https://t.me/s/<username>
+  * BotFather bot handles moderation keyboards, admin panel, and publishing
 
-Control panel (private chat with the bot, admins only):
-  * start / stop parsing
-  * log the observer account in *through the chat* (phone -> code -> 2FA)
-  * log the observer account out
-  * view parsing statistics and recent logs
-  * edit the parsing keywords
-
-Moderation flow:
-  1. user sees a keyword-matching post in a source channel.
-  2. user forwards it into MODERATION_GROUP; bot replies with a category keyboard.
-  3. A moderator optionally sets a publish time (per post), then taps a category.
-  4. user publishes the vacancy to TARGET_CHANNEL (category image + tags, foreign
-     hashtags stripped), then both moderation messages are deleted.
+Flow:
+  1. Poller finds a keyword-matching post on a public channel preview.
+  2. Bot posts a copy into MODERATION_GROUP with a category keyboard.
+  3. Moderator sets optional publish time, then picks a subcategory.
+  4. Bot publishes (scheduled) into the target channel from categories.json.
 """
+from __future__ import annotations
+
 import asyncio
 import html
 import json
@@ -26,18 +20,16 @@ import os
 import re
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
-from telethon import TelegramClient, events, Button
-from telethon.tl.types import MessageMediaWebPage
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    MediaCaptionTooLongError,
-)
+import httpx
+from telethon import Button, TelegramClient, events
+from telethon.errors import MediaCaptionTooLongError
 
 import config
+from scraper import ScrapedPost, fetch_channel_posts, make_http_client, source_usernames
 from store import Store
+from tg_time import sync_telegram_time
 
 # --- logging: console + an in-memory ring buffer readable from the bot chat ----
 LOG_BUFFER: deque[str] = deque(maxlen=300)
@@ -61,24 +53,29 @@ _buf = _BufferHandler()
 _buf.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%H:%M:%S"))
 log.addHandler(_buf)
 
-user = TelegramClient(config.SESSION, config.API_ID, config.API_HASH)
 bot = TelegramClient(config.BOT_SESSION, config.API_ID, config.API_HASH)
 store = Store(config.DB_PATH)
+http: httpx.AsyncClient | None = None
 
-# Runtime state, toggled from the control panel.
-STATE = {"parsing": False, "authorized": False}
-STATS = {"matched": 0, "forwarded": 0, "published": 0, "skipped": 0, "errors": 0,
-         "last": None, "started": datetime.now()}
-# Per-admin conversation state.
-LOGIN: dict[int, dict] = {}    # login flow: uid -> {"step","phone","hash"}
-PENDING: dict[int, dict] = {}  # other input flows: uid -> {"action": ...}
+STATE = {"parsing": False}
+STATS = {
+    "matched": 0,
+    "forwarded": 0,
+    "published": 0,
+    "skipped": 0,
+    "errors": 0,
+    "last": None,
+    "started": datetime.now(),
+}
+PENDING: dict[int, dict] = {}  # uid -> {"action": ...}
 
 KEYWORDS_PATH = str(config.BASE_DIR / "keywords.json")
 SCHEDULE_PATH = str(config.BASE_DIR / "schedule.txt")
 
-# Time (hour, minute) at which published posts are scheduled, in POST_TZ.
 SCHEDULE = {"hh": 10, "mm": 0}
-POST_TZ = timezone(timedelta(hours=config.TZ_OFFSET))  # e.g. UTC+3 = МСК
+POST_TZ = timezone(timedelta(hours=config.TZ_OFFSET))
+
+SOURCES = source_usernames(config.SOURCE_CHANNELS)
 
 
 def is_admin(uid: int) -> bool:
@@ -86,7 +83,7 @@ def is_admin(uid: int) -> bool:
 
 
 # ===========================================================================
-# Scheduled-post time (editable at runtime, persisted to schedule.txt)
+# Scheduled-post time
 # ===========================================================================
 def _parse_hhmm(s: str) -> tuple[int, int] | None:
     s = s.strip().replace(".", ":").replace("-", ":")
@@ -112,8 +109,10 @@ def load_schedule() -> None:
     if parsed is None:
         parsed = _parse_hhmm(config.SCHEDULE_TIME) or (10, 0)
     SCHEDULE["hh"], SCHEDULE["mm"] = parsed
-    log.info("Post schedule time: %02d:%02d %s (UTC%+d)",
-             SCHEDULE["hh"], SCHEDULE["mm"], config.TZ_NAME, config.TZ_OFFSET)
+    log.info(
+        "Post schedule time: %02d:%02d %s (UTC%+d)",
+        SCHEDULE["hh"], SCHEDULE["mm"], config.TZ_NAME, config.TZ_OFFSET,
+    )
 
 
 def save_schedule() -> None:
@@ -125,10 +124,6 @@ def save_schedule() -> None:
 
 
 def _next_schedule_dt(hh: int | None = None, mm: int | None = None) -> datetime:
-    """Next occurrence of HH:MM in POST_TZ (today, else tomorrow).
-
-    Uses per-post hh/mm when given, otherwise the global SCHEDULE.
-    """
     h = SCHEDULE["hh"] if hh is None else hh
     m = SCHEDULE["mm"] if mm is None else mm
     now = datetime.now(POST_TZ)
@@ -139,7 +134,7 @@ def _next_schedule_dt(hh: int | None = None, mm: int | None = None) -> datetime:
 
 
 # ===========================================================================
-# Keywords persistence (editable at runtime from the bot)
+# Keywords
 # ===========================================================================
 def load_keywords() -> None:
     if os.path.exists(KEYWORDS_PATH):
@@ -162,7 +157,6 @@ def save_keywords() -> None:
 
 
 def _parse_kw_tokens(s: str) -> list[str]:
-    # Comma/newline separated so multi-word phrases ("looking for") stay intact.
     return [t.strip().lower() for t in re.split(r"[,\n]+", s) if t.strip()]
 
 
@@ -176,13 +170,10 @@ def is_vacancy(text: str | None) -> bool:
     return any(kw in low for kw in config.KEYWORDS)
 
 
-# A hashtag preceded by start-of-line or whitespace (so we never touch a '#'
-# inside a URL fragment). \w includes Cyrillic under re.UNICODE.
 _HASHTAG_RE = re.compile(r"(^|\s)#\w+", re.UNICODE | re.MULTILINE)
 
 
 def strip_hashtags(text: str) -> str:
-    """Remove the source post's own hashtags, then tidy the leftover whitespace."""
     text = _HASHTAG_RE.sub(r"\1", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"[ \t]+(\n|$)", r"\1", text)
@@ -190,37 +181,23 @@ def strip_hashtags(text: str) -> str:
     return text.strip()
 
 
-# Any leading bullet marker -> unified "— ".
 _BULLET_RE = re.compile(r"^\s*[—–\-•*●▪‣·◦▸►]\s*")
-# A t.me link (used to drop the source channel's promo footer).
 _TME_RE = re.compile(r"(https?://)?t\.me/\S+", re.IGNORECASE)
 
 
 def _is_section_header(line: str) -> bool:
-    """A line that starts with an emoji/pictograph (💎 Что предлагаем: ...)."""
     s = line.lstrip()
-    return bool(s) and ord(s[0]) >= 0x2190  # arrows/symbols/emoji region; excludes '—' (0x2014)
+    return bool(s) and ord(s[0]) >= 0x2190
 
 
 def format_post(text: str) -> str:
-    """Reformat a vacancy into a consistent look and return HTML.
-
-    Input is the message's HTML (message.text), so inline links/formatting are
-    preserved. Steps:
-    - bold title (first non-empty line)
-    - unify bullets to "— "
-    - blank line before each emoji section header
-    - strip the source hashtags and the trailing promo footer (keeps body links)
-    """
+    """Reformat a vacancy into a consistent look and return HTML."""
     text = strip_hashtags(text)
     lines = [ln.rstrip() for ln in text.splitlines()]
 
-    # Drop the trailing promo/footer block only: blank or t.me-link lines at the
-    # very end. Links inside the body are kept.
     while lines and (not lines[-1].strip() or _TME_RE.search(lines[-1])):
         lines.pop()
 
-    # Normalize bullets + ensure spacing before section headers.
     out: list[str] = []
     for ln in lines:
         if _BULLET_RE.match(ln):
@@ -233,7 +210,6 @@ def format_post(text: str) -> str:
     if not body:
         return ""
 
-    # Text is already valid HTML from Telethon — do NOT escape (would kill links).
     parts = body.split("\n", 1)
     title = parts[0].strip()
     rest = parts[1].lstrip("\n") if len(parts) > 1 else ""
@@ -247,10 +223,11 @@ def status_text() -> str:
     lines = [
         "🤖 <b>Панель управления</b>",
         "",
-        f"Аккаунт: {'✅ авторизован' if STATE['authorized'] else '❌ не авторизован'}",
+        "Режим: 🌐 публичный парсинг <code>t.me/s/…</code> (без аккаунта)",
         f"Парсинг: {'🟢 включён' if STATE['parsing'] else '🔴 выключен'}",
+        f"Интервал опроса: {config.POLL_INTERVAL}с",
         f"Время постинга: 🕒 {SCHEDULE['hh']:02d}:{SCHEDULE['mm']:02d} {config.TZ_NAME}",
-        f"Источников: {len(config.SOURCE_CHANNELS)} · "
+        f"Источников: {len(SOURCES)} · "
         f"категорий: {len(config.CATEGORIES)} · ключевых слов: {len(config.KEYWORDS)}",
     ]
     if not config.ADMIN_IDS:
@@ -265,7 +242,7 @@ def stats_text() -> str:
     return (
         "📊 <b>Статистика парсинга</b>\n\n"
         f"Найдено по словам: <b>{s['matched']}</b>\n"
-        f"Переслано в модерацию: <b>{s['forwarded']}</b>\n"
+        f"Отправлено в модерацию: <b>{s['forwarded']}</b>\n"
         f"Опубликовано: <b>{s['published']}</b>\n"
         f"Пропущено: <b>{s['skipped']}</b>\n"
         f"Ошибок: <b>{s['errors']}</b>\n"
@@ -299,22 +276,18 @@ def keywords_prompt() -> str:
 
 
 def control_menu():
-    """Return (text, buttons) for the control panel, reflecting current STATE."""
     if STATE["parsing"]:
         parse_btn = Button.inline("⏸ Остановить парсинг", b"ctl:stop")
     else:
         parse_btn = Button.inline("▶️ Запустить парсинг", b"ctl:start")
-    if STATE["authorized"]:
-        acc_btn = Button.inline("🚪 Выйти из аккаунта", b"ctl:logout")
-    else:
-        acc_btn = Button.inline("🔑 Войти в аккаунт", b"ctl:login")
     rows = [
         [parse_btn],
-        [acc_btn],
         [Button.inline("📊 Статистика", b"ctl:stats"), Button.inline("📋 Логи", b"ctl:logs")],
         [Button.inline("🏷 Ключевые слова", b"ctl:keywords")],
-        [Button.inline(f"🕒 Время постинга ({SCHEDULE['hh']:02d}:{SCHEDULE['mm']:02d})",
-                       b"ctl:schedule")],
+        [Button.inline(
+            f"🕒 Время постинга ({SCHEDULE['hh']:02d}:{SCHEDULE['mm']:02d})",
+            b"ctl:schedule",
+        )],
         [Button.inline("ℹ️ Обновить", b"ctl:status")],
     ]
     return status_text(), rows
@@ -332,22 +305,19 @@ def _grid(buttons, per_row=2):
     return rows
 
 
-# --- 4-level navigation: Category -> Branch -> Channel -> Subcategory(tags) ------
 _NAV_TITLES = {
-    "root":   "🗂 Выберите категорию:",
-    "cat":    "🌿 {} — выберите ответвление:",
+    "root": "🗂 Выберите категорию:",
+    "cat": "🌿 {} — выберите ответвление:",
     "branch": "📢 {} — выберите канал:",
-    "chan":   "🏷 {} — выберите тег (вид поста):",
+    "chan": "🏷 {} — выберите тег (вид поста):",
 }
 
 
 def _path_data(path: list[int]) -> str:
-    """Encode a navigation path as callback data ('p', 'p:0', 'p:0:1', ...)."""
     return "p" if not path else "p:" + ":".join(map(str, path))
 
 
 def _node_children(path: list[int]):
-    """Return (kind, label, children) for a path. kind: root/cat/branch/chan/leaf."""
     if not path:
         return "root", None, config.CATEGORIES
     cat = config.CATEGORIES[path[0]]
@@ -370,12 +340,10 @@ def _time_button_label(schedule_hh: int | None = None, schedule_mm: int | None =
 
 
 def _time_data(path: list[int]) -> bytes:
-    """Callback data for the per-post time button ('time' or 'time:0:1')."""
     return b"time" if not path else ("time:" + ":".join(map(str, path))).encode()
 
 
 def _time_hour_keyboard() -> list:
-    """Inline keyboard: pick hour 0..23, then cancel."""
     hours = [Button.inline(f"{h:02d}", data=f"th:{h}".encode()) for h in range(24)]
     rows = _grid(hours, per_row=6)
     rows.append([Button.inline("❌ Отмена", data=b"timecancel")])
@@ -383,13 +351,9 @@ def _time_hour_keyboard() -> list:
 
 
 def _time_minute_keyboard(hour: int) -> list:
-    """Inline keyboard: pick minutes for a chosen hour."""
-    rows = []
-    # 00..55 step 5 — covers 10:00, 15:00 and other common slots.
     mins = list(range(0, 60, 5))
-    btns = [Button.inline(f"{hour:02d}:{m:02d}", data=f"tm:{hour}:{m}".encode())
-            for m in mins]
-    rows.extend(_grid(btns, per_row=4))
+    btns = [Button.inline(f"{hour:02d}:{m:02d}", data=f"tm:{hour}:{m}".encode()) for m in mins]
+    rows = _grid(btns, per_row=4)
     rows.append([
         Button.inline("⬅️ Час", data=b"thback"),
         Button.inline("❌ Отмена", data=b"timecancel"),
@@ -398,12 +362,13 @@ def _time_minute_keyboard(hour: int) -> list:
 
 
 def nav_keyboard(path: list[int], schedule_hh: int | None = None, schedule_mm: int | None = None):
-    """Build (title, buttons) listing the children at `path`."""
     kind, label, children = _node_children(path)
     tmpl = _NAV_TITLES[kind]
     title = tmpl.format(label) if "{}" in tmpl else tmpl
-    btns = [Button.inline(c["label"], data=_path_data(path + [i]).encode())
-            for i, c in enumerate(children)]
+    btns = [
+        Button.inline(c["label"], data=_path_data(path + [i]).encode())
+        for i, c in enumerate(children)
+    ]
     rows = _grid(btns)
     rows.append([Button.inline(
         _time_button_label(schedule_hh, schedule_mm), data=_time_data(path),
@@ -417,27 +382,35 @@ def nav_keyboard(path: list[int], schedule_hh: int | None = None, schedule_mm: i
 
 
 # ===========================================================================
-# Observer: watch the source channels
+# Scraper poller
 # ===========================================================================
-@user.on(events.NewMessage(chats=config.SOURCE_CHANNELS))
-async def on_source_message(event: events.NewMessage.Event):
-    if not STATE["parsing"] or not STATE["authorized"]:
-        return
-    if not is_vacancy(event.raw_text):
-        return
-
-    STATS["matched"] += 1
-    STATS["last"] = datetime.now()
-    chat_name = getattr(event.chat, "title", event.chat_id)
-    log.info("Match in '%s' (msg %s)", chat_name, event.message.id)
+async def _send_to_moderation(post: ScrapedPost) -> None:
+    header = (
+        f"📥 <b>@{html.escape(post.username)}</b> · "
+        f"<a href=\"{html.escape(post.link, quote=True)}\">оригинал</a>\n\n"
+    )
+    body = post.text_html or html.escape(post.text_plain) or "<i>(без текста)</i>"
+    preview = header + body
+    if len(preview) > 4000:
+        preview = preview[:3990] + "…"
 
     try:
-        forwarded = await event.message.forward_to(config.MODERATION_GROUP)
+        if post.media_urls and http is not None:
+            raw = await _download_media(post.media_urls[0])
+            if raw is not None:
+                preview_msg = await bot.send_file(
+                    config.MODERATION_GROUP,
+                    file=raw,
+                    caption=preview,
+                )
+            else:
+                preview_msg = await bot.send_message(config.MODERATION_GROUP, preview)
+        else:
+            preview_msg = await bot.send_message(config.MODERATION_GROUP, preview)
     except Exception as exc:  # noqa: BLE001
         STATS["errors"] += 1
-        log.error("Failed to forward to moderation group: %s", exc)
+        log.error("Failed to send preview to moderation: %s", exc)
         return
-    fwd = forwarded[0] if isinstance(forwarded, list) else forwarded
 
     try:
         title, kb = nav_keyboard([])
@@ -445,7 +418,7 @@ async def on_source_message(event: events.NewMessage.Event):
             config.MODERATION_GROUP,
             title,
             buttons=kb,
-            reply_to=fwd.id,
+            reply_to=preview_msg.id,
         )
     except Exception as exc:  # noqa: BLE001
         STATS["errors"] += 1
@@ -453,12 +426,103 @@ async def on_source_message(event: events.NewMessage.Event):
         return
 
     STATS["forwarded"] += 1
-    store.add(kb_msg.id, event.chat_id, event.message.id, fwd.id)
-    log.info("Forwarded to moderation (fwd %s, kb %s)", fwd.id, kb_msg.id)
+    store.add(
+        kb_msg.id,
+        post.username,
+        post.msg_id,
+        preview_msg.id,
+        post.text_html or html.escape(post.text_plain),
+        post.media_urls,
+        post.link,
+    )
+    log.info("Queued for moderation %s (preview %s, kb %s)", post.key, preview_msg.id, kb_msg.id)
+
+
+async def _download_media(url: str) -> BytesIO | None:
+    assert http is not None
+    try:
+        resp = await http.get(url)
+        resp.raise_for_status()
+        data = BytesIO(resp.content)
+        # Telethon needs a name to infer type.
+        suffix = ".jpg"
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "png" in ctype:
+            suffix = ".png"
+        elif "webp" in ctype:
+            suffix = ".webp"
+        elif "gif" in ctype:
+            suffix = ".gif"
+        elif "mp4" in ctype or "video" in ctype:
+            suffix = ".mp4"
+        data.name = f"media{suffix}"
+        return data
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Media download failed (%s): %s", url[:80], exc)
+        return None
+
+
+async def process_post(post: ScrapedPost) -> None:
+    if store.is_seen(post.username, post.msg_id):
+        return
+    store.mark_seen(post.username, post.msg_id)
+
+    if not STATE["parsing"]:
+        return
+    if not is_vacancy(post.text_plain or post.text_html):
+        return
+
+    STATS["matched"] += 1
+    STATS["last"] = datetime.now()
+    log.info("Match in @%s (msg %s)", post.username, post.msg_id)
+    await _send_to_moderation(post)
+
+
+async def poll_once() -> None:
+    if http is None:
+        return
+    for username in SOURCES:
+        try:
+            posts = await fetch_channel_posts(http, username)
+        except Exception as exc:  # noqa: BLE001
+            STATS["errors"] += 1
+            log.error("Poll @%s failed: %s", username, exc)
+            continue
+
+        if not posts:
+            continue
+
+        if config.SEED_SEEN_ON_START and not store.has_seen_any(username):
+            store.mark_seen_many(username, [p.msg_id for p in posts])
+            log.info("Seeded %d seen posts for @%s (no flood on first run)", len(posts), username)
+            continue
+
+        for post in posts:
+            try:
+                await process_post(post)
+            except Exception as exc:  # noqa: BLE001
+                STATS["errors"] += 1
+                log.error("Process %s failed: %s", post.key, exc)
+
+
+async def poll_loop() -> None:
+    log.info(
+        "Poller started: %d sources, interval %ss",
+        len(SOURCES), config.POLL_INTERVAL,
+    )
+    # Stagger first poll slightly so bot.start settles.
+    await asyncio.sleep(2)
+    while True:
+        try:
+            await poll_once()
+        except Exception as exc:  # noqa: BLE001
+            STATS["errors"] += 1
+            log.error("Poll loop error: %s", exc)
+        await asyncio.sleep(config.POLL_INTERVAL)
 
 
 # ===========================================================================
-# Bot: moderation category buttons (in the moderation group)
+# Bot: moderation category buttons
 # ===========================================================================
 @bot.on(events.CallbackQuery(pattern=rb"(timecancel|thback|th:|tm:|time|skip|p)"))
 async def on_category(event: events.CallbackQuery.Event):
@@ -538,9 +602,9 @@ async def on_category(event: events.CallbackQuery.Event):
     if not mapping:
         await event.answer("Эта заявка уже обработана.", alert=True)
         return
-    source_chat = mapping["source_chat"]
+    source = mapping["source"]
     source_msg_id = mapping["source_msg"]
-    fwd_id = mapping["fwd_msg_id"]
+    preview_id = mapping["preview_msg_id"]
     schedule_hh = mapping["schedule_hh"]
     schedule_mm = mapping["schedule_mm"]
 
@@ -548,9 +612,9 @@ async def on_category(event: events.CallbackQuery.Event):
         PENDING.pop(uid, None)
         store.remove(event.message_id)
         STATS["skipped"] += 1
-        await _cleanup(fwd_id, event.message_id)
+        await _cleanup(preview_id, event.message_id)
         await event.answer("Пропущено.")
-        log.info("Skipped candidate %s/%s", source_chat, source_msg_id)
+        log.info("Skipped candidate %s/%s", source, source_msg_id)
         return
 
     if data == "time" or data.startswith("time:"):
@@ -570,22 +634,19 @@ async def on_category(event: events.CallbackQuery.Event):
         await event.answer()
         return
 
-    # Navigation path: 'p' -> root, 'p:0:1:2' -> category0/channel1/rubric2, etc.
     parts = data.split(":")
     path = [int(x) for x in parts[1:]] if len(parts) > 1 else []
     kind, _, _ = _node_children(path)
 
     if kind != "leaf":
-        # Still navigating — redraw the menu for this level.
         title, kb = nav_keyboard(path, schedule_hh, schedule_mm)
         try:
             await event.edit(title, buttons=kb)
-        except Exception:  # noqa: BLE001 - unchanged message
+        except Exception:  # noqa: BLE001
             pass
         await event.answer()
         return
 
-    # Leaf selected -> resolve channel (+ copy_media) and the subcategory target.
     chan = config.CATEGORIES[path[0]]["branches"][path[1]]["channels"][path[2]]
     leaf = chan["subcategories"][path[3]]
     if not chan["channel_id"]:
@@ -601,8 +662,10 @@ async def on_category(event: events.CallbackQuery.Event):
     }
 
     published = await _publish(
-        source_chat, source_msg_id, target,
-        schedule_hh=schedule_hh, schedule_mm=schedule_mm,
+        mapping,
+        target,
+        schedule_hh=schedule_hh,
+        schedule_mm=schedule_mm,
     )
     if not published:
         STATS["errors"] += 1
@@ -618,10 +681,12 @@ async def on_category(event: events.CallbackQuery.Event):
         f"({when.strftime('%H:%M')})"
     )
     if config.DELETE_AFTER_PUBLISH:
-        await _cleanup(fwd_id, event.message_id)
-    log.info("Published %s/%s -> channel %s as '%s' at %s",
-             source_chat, source_msg_id, chan["channel_id"], leaf["label"],
-             when.strftime("%Y-%m-%d %H:%M"))
+        await _cleanup(preview_id, event.message_id)
+    log.info(
+        "Published %s/%s -> channel %s as '%s' at %s",
+        source, source_msg_id, chan["channel_id"], leaf["label"],
+        when.strftime("%Y-%m-%d %H:%M"),
+    )
 
 
 async def _restore_moderation_keyboard(kb_msg_id: int, path: list[int]) -> None:
@@ -636,7 +701,6 @@ async def _restore_moderation_keyboard(kb_msg_id: int, path: list[int]) -> None:
 
 
 async def _cancel_post_schedule(uid: int) -> bool:
-    """Clear pending time input and restore the category keyboard. Returns True if cancelled."""
     pending = PENDING.pop(uid, None)
     if not pending or pending.get("action") != "post_schedule":
         return False
@@ -648,7 +712,6 @@ async def _cancel_post_schedule(uid: int) -> bool:
 
 
 async def _apply_post_schedule(uid: int, hh: int, mm: int) -> bool:
-    """Persist per-post time and redraw the category keyboard."""
     pending = PENDING.get(uid) or {}
     if pending.get("action") != "post_schedule":
         return False
@@ -667,7 +730,7 @@ async def _apply_post_schedule(uid: int, hh: int, mm: int) -> bool:
 
 
 # ===========================================================================
-# Bot: control panel buttons (private chat, admins only)
+# Bot: control panel
 # ===========================================================================
 @bot.on(events.CallbackQuery(pattern=b"ctl:"))
 async def on_control(event: events.CallbackQuery.Event):
@@ -678,8 +741,8 @@ async def on_control(event: events.CallbackQuery.Event):
     action = event.data.decode().split(":", 1)[1]
 
     if action == "start":
-        if not STATE["authorized"]:
-            await event.answer("Сначала войдите в аккаунт.", alert=True)
+        if not SOURCES:
+            await event.answer("Нет публичных источников (@username) в SOURCE_CHANNELS.", alert=True)
             return
         STATE["parsing"] = True
         await event.answer("Парсинг запущен.")
@@ -711,34 +774,14 @@ async def on_control(event: events.CallbackQuery.Event):
             "/cancel — отмена"
         )
         return
-    elif action == "login":
-        if STATE["authorized"]:
-            await event.answer("Аккаунт уже авторизован.", alert=True)
-            return
-        LOGIN[uid] = {"step": "phone"}
-        await event.answer()
-        await event.respond(
-            "🔑 Отправьте номер телефона аккаунта-наблюдателя в формате "
-            "<code>+79991234567</code>.\n\n/cancel — отмена"
-        )
-        return
-    elif action == "logout":
-        if not STATE["authorized"]:
-            await event.answer("Аккаунт не авторизован.", alert=True)
-            return
-        await do_logout()
-        await event.answer("Вы вышли из аккаунта.")
 
     text, rows = control_menu()
     try:
         await event.edit(text, buttons=rows)
-    except Exception:  # noqa: BLE001 - message unchanged, ignore
+    except Exception:  # noqa: BLE001
         pass
 
 
-# ===========================================================================
-# Bot: private messages (menu + conversations)
-# ===========================================================================
 @bot.on(events.NewMessage(func=lambda e: e.is_private))
 async def on_private(event: events.NewMessage.Event):
     uid = event.sender_id
@@ -749,14 +792,9 @@ async def on_private(event: events.NewMessage.Event):
     text = (event.raw_text or "").strip()
 
     if text == "/cancel":
-        LOGIN.pop(uid, None)
         PENDING.pop(uid, None)
         _, rows = control_menu()
         await event.respond("Отменено.", buttons=rows)
-        return
-
-    if uid in LOGIN and not text.startswith("/"):
-        await handle_login_step(event, uid, text)
         return
 
     if uid in PENDING and not text.startswith("/"):
@@ -773,7 +811,6 @@ async def handle_pending(event, uid: int, text: str):
         await apply_keywords_edit(event, uid, text)
     elif action == "schedule":
         await apply_schedule_edit(event, uid, text)
-
 
 
 async def apply_schedule_edit(event, uid: int, text: str):
@@ -825,184 +862,39 @@ async def apply_keywords_edit(event, uid: int, text: str):
     log.info("Keywords updated by %s -> %d words", uid, len(config.KEYWORDS))
 
 
-async def handle_login_step(event, uid: int, text: str):
-    st = LOGIN[uid]
-    step = st["step"]
-
-    if step == "phone":
-        phone = text.replace(" ", "").strip()
-        if not phone.startswith("+"):
-            await event.respond(
-                "Номер должен быть в международном формате, например "
-                "<code>+79991234567</code>. Попробуйте ещё раз:"
-            )
-            return
-        st["phone"] = phone
-        try:
-            if not user.is_connected():
-                await user.connect()
-            sent = await user.send_code_request(phone)
-            code_hash = getattr(sent, "phone_code_hash", None)
-            if not code_hash:
-                LOGIN.pop(uid, None)
-                await event.respond(
-                    "Telegram не вернул phone_code_hash. Попробуйте снова или "
-                    "войдите через консоль: <code>python login.py</code>"
-                )
-                return
-            st["hash"] = code_hash
-            st["step"] = "code"
-            await event.respond(
-                "💬 Код отправлен.\n\n"
-                "⚠️ <b>Важно:</b> если ввести код как есть, Telegram сразу его "
-                "сбросит (код ушёл через чат). Введите цифры <b>через пробел или дефис</b>:\n"
-                "<code>1 2 3 4 5</code> или <code>1-2-3-4-5</code>\n\n"
-                "Надёжнее войти на сервере командой <code>python login.py</code>.\n\n"
-                "/cancel — отмена"
-            )
-        except Exception as exc:  # noqa: BLE001
-            LOGIN.pop(uid, None)
-            await event.respond(f"Ошибка отправки кода: {exc}")
-        return
-
-    if step == "code":
-        code = re.sub(r"\D", "", text)
-        code_hash = st.get("hash")
-        phone = st.get("phone")
-        if not code or not phone or not code_hash:
-            LOGIN.pop(uid, None)
-            await event.respond(
-                "Сессия входа сброшена (нет phone_code_hash). "
-                "Нажмите 🔑 Войти заново или выполните на сервере:\n"
-                "<code>python login.py</code>"
-            )
-            return
-        try:
-            await user.sign_in(phone=phone, code=code, phone_code_hash=code_hash)
-        except SessionPasswordNeededError:
-            st["step"] = "password"
-            await event.respond("🔒 Включена двухфакторная защита. Введите пароль (2FA):")
-            return
-        except PhoneCodeInvalidError:
-            await event.respond(
-                "Неверный или уже сброшенный код.\n\n"
-                "Telegram часто аннулирует код, если его отправили в чат бота.\n"
-                "1) Нажмите /cancel и войдите заново, введя код как "
-                "<code>1 2 3 4 5</code>\n"
-                "2) Либо на сервере:\n"
-                "<code>sudo systemctl stop workparser</code>\n"
-                "<code>cd /opt/WorkParserBot && source venv/bin/activate && python login.py</code>"
-            )
-            LOGIN.pop(uid, None)
-            return
-        except PhoneCodeExpiredError:
-            LOGIN.pop(uid, None)
-            await event.respond("Код истёк. Начните вход заново кнопкой 🔑.")
-            return
-        except Exception as exc:  # noqa: BLE001
-            LOGIN.pop(uid, None)
-            await event.respond(f"Ошибка входа: {exc}")
-            return
-        await _finish_login(event, uid)
-        return
-
-    if step == "password":
-        try:
-            await user.sign_in(password=text)
-        except Exception as exc:  # noqa: BLE001
-            await event.respond(f"Неверный пароль или ошибка: {exc}. Попробуйте снова:")
-            return
-        await _finish_login(event, uid)
-        return
-
-
-async def _finish_login(event, uid: int):
-    LOGIN.pop(uid, None)
-    STATE["authorized"] = True
-    if config.PARSING_ON_START:
-        STATE["parsing"] = True
-    user.parse_mode = "html"
-    try:
-        await event.delete()  # remove the message that held the code/password
-    except Exception:  # noqa: BLE001
-        pass
-    me = await user.get_me()
-    log.info("Observer logged in via bot: %s (id=%s)", me.first_name, me.id)
-    _, rows = control_menu()
-    await event.respond(
-        f"✅ Вход выполнен: <b>{me.first_name}</b> (id=<code>{me.id}</code>).",
-        buttons=rows,
-    )
-
-
-async def do_logout():
-    try:
-        await user.log_out()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("log_out error: %s", exc)
-    STATE["authorized"] = False
-    STATE["parsing"] = False
-    try:
-        if not user.is_connected():
-            await user.connect()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Reconnect after logout failed: %s", exc)
-    log.info("Observer logged out.")
-
-
 # ===========================================================================
 # Publishing / cleanup
 # ===========================================================================
-_MESSAGE_LIMIT = 4096          # Telegram text-message limit
+_MESSAGE_LIMIT = 4096
 
 
 async def _send_post(target, media: list, text_html: str, schedule=None) -> None:
-    """Publish text (+ optional media), scheduled for `schedule` (datetime) if set.
-
-    Try the text as a single-message caption; only if Telegram rejects it (over the
-    account's 1024/2048 limit) fall back to media on top + full text as a separate
-    message. This respects Premium automatically without guessing the limit."""
     if not media:
-        await user.send_message(target, text_html, schedule=schedule)
+        await bot.send_message(target, text_html, schedule=schedule)
         return
 
     file = media if len(media) > 1 else media[0]
     try:
-        await user.send_file(target, file=file, caption=text_html, schedule=schedule)
+        await bot.send_file(target, file=file, caption=text_html, schedule=schedule)
     except MediaCaptionTooLongError:
-        await user.send_file(target, file=file, schedule=schedule)
-        await user.send_message(target, text_html, schedule=schedule)
+        await bot.send_file(target, file=file, schedule=schedule)
+        await bot.send_message(target, text_html, schedule=schedule)
 
 
 async def _publish(
-    source_chat: int,
-    source_msg_id: int,
+    mapping: dict,
     target: dict,
     schedule_hh: int | None = None,
     schedule_mm: int | None = None,
 ) -> bool:
-    """Re-post the vacancy to the target's channel.
-
-    target = {label, tags, image, channel_id, copy_media}.
-    copy_media=True keeps the post's own photo/video instead of the category image.
-    schedule_hh/mm override the global SCHEDULE when set for this post.
-    """
     channel = target["channel_id"]
-    try:
-        original = await user.get_messages(source_chat, ids=source_msg_id)
-    except Exception as exc:  # noqa: BLE001
-        log.error("Could not fetch original message: %s", exc)
-        return False
-    if original is None:
-        log.error("Original message %s in %s no longer exists", source_msg_id, source_chat)
-        return False
+    raw_html = mapping.get("text_html") or ""
 
     if config.AUTO_FORMAT:
-        body = format_post(original.text or "")
+        body = format_post(raw_html)
     else:
-        body = strip_hashtags(original.text or "")
+        body = strip_hashtags(raw_html)
 
-    # Footer: hashtags line + masked links line (user sees the text, click = url).
     footer_parts = []
     tag_line = " ".join(target["tags"])
     if tag_line:
@@ -1016,13 +908,13 @@ async def _publish(
     footer = "\n".join(footer_parts)
     final_text = f"{body}\n\n{footer}".strip() if footer else body
 
-    source_media = (original.media
-                    if original.media and not isinstance(original.media, MessageMediaWebPage)
-                    else None)
-
+    media: list = []
     if target.get("copy_media"):
-        # Copy the post's own photo/video; do NOT substitute the category image.
-        media = [source_media] if source_media else []
+        for url in mapping.get("media_urls") or []:
+            raw = await _download_media(url)
+            if raw is not None:
+                media.append(raw)
+                break  # one photo is enough for caption posts
     else:
         cat_image = target["image"]
         has_cat_image = bool(cat_image) and os.path.exists(cat_image)
@@ -1030,10 +922,12 @@ async def _publish(
             log.warning("Category image not found: %s (posting without it)", cat_image)
         if has_cat_image:
             media = [cat_image]
-        elif source_media:
-            media = [source_media]
         else:
-            media = []
+            for url in mapping.get("media_urls") or []:
+                raw = await _download_media(url)
+                if raw is not None:
+                    media.append(raw)
+                    break
 
     when = _next_schedule_dt(schedule_hh, schedule_mm)
     try:
@@ -1042,57 +936,61 @@ async def _publish(
         return True
     except Exception as exc:  # noqa: BLE001
         log.error("Failed to publish to channel %s: %s", channel, exc)
-        try:  # last resort: text only
+        try:
             if len(final_text) <= _MESSAGE_LIMIT:
-                await user.send_message(channel, final_text, schedule=when)
+                await bot.send_message(channel, final_text, schedule=when)
                 return True
         except Exception as exc2:  # noqa: BLE001
             log.error("Fallback publish also failed: %s", exc2)
         return False
 
 
-async def _cleanup(fwd_id: int, kb_id: int) -> None:
-    """Delete the forwarded post (user's message) and the keyboard (bot's message)."""
-    try:
-        await user.delete_messages(config.MODERATION_GROUP, [fwd_id])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not delete forwarded message: %s", exc)
-    try:
-        await bot.delete_messages(config.MODERATION_GROUP, [kb_id])
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Could not delete keyboard message: %s", exc)
+async def _cleanup(preview_id: int, kb_id: int) -> None:
+    for mid in (preview_id, kb_id):
+        try:
+            await bot.delete_messages(config.MODERATION_GROUP, [mid])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Could not delete message %s: %s", mid, exc)
 
 
 # ===========================================================================
 # Startup
 # ===========================================================================
 async def main():
+    global http
+
     load_keywords()
     load_schedule()
+
+    if not SOURCES:
+        log.error(
+            "No public @usernames in SOURCE_CHANNELS — nothing to scrape. "
+            "Numeric channel ids cannot be scraped without a user account."
+        )
+
+    http = make_http_client()
     await bot.start(bot_token=config.BOT_TOKEN)
     bot.parse_mode = "html"
-    await user.connect()
+    await sync_telegram_time(bot, label="bot", warn=lambda m: log.info("%s", m))
 
-    if await user.is_user_authorized():
-        STATE["authorized"] = True
-        user.parse_mode = "html"
-        if config.PARSING_ON_START:
-            STATE["parsing"] = True
-        me = await user.get_me()
-        log.info("Observer already logged in: %s (id=%s)", me.first_name, me.id)
-    else:
-        log.warning("Observer NOT logged in. Open the bot in Telegram and press '🔑 Войти в аккаунт'.")
+    if config.PARSING_ON_START and SOURCES:
+        STATE["parsing"] = True
 
     bot_me = await bot.get_me()
-    log.info("Bot @%s ready | parsing=%s authorized=%s",
-             bot_me.username, STATE["parsing"], STATE["authorized"])
-    if not config.ADMIN_IDS:
-        log.warning("ADMIN_IDS is empty — anyone who opens the bot can control it. Set ADMIN_IDS in .env!")
-
-    await asyncio.gather(
-        user.run_until_disconnected(),
-        bot.run_until_disconnected(),
+    log.info(
+        "Bot @%s ready | parsing=%s | sources=%s | poll=%ss",
+        bot_me.username, STATE["parsing"], len(SOURCES), config.POLL_INTERVAL,
     )
+    if not config.ADMIN_IDS:
+        log.warning("ADMIN_IDS is empty — anyone who opens the bot can control it.")
+
+    try:
+        await asyncio.gather(
+            bot.run_until_disconnected(),
+            poll_loop(),
+        )
+    finally:
+        await http.aclose()
 
 
 if __name__ == "__main__":
