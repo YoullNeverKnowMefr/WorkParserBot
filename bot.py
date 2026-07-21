@@ -912,12 +912,12 @@ async def _publish(
     tag_line = " ".join(target["tags"])
     if tag_line:
         footer_parts.append(tag_line)
-    links_line = " ".join(
+    links_block = "\n".join(
         f'<a href="{html.escape(l["url"], quote=True)}">{html.escape(l["text"])}</a>'
         for l in target.get("links", [])
     )
-    if links_line:
-        footer_parts.append(links_line)
+    if links_block:
+        footer_parts.append(links_block)
     footer = "\n".join(footer_parts)
     final_text = f"{body}\n\n{footer}".strip() if footer else body
 
