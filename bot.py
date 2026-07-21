@@ -227,6 +227,7 @@ def status_text() -> str:
         f"Парсинг: {'🟢 включён' if STATE['parsing'] else '🔴 выключен'}",
         f"Интервал опроса: {config.POLL_INTERVAL}с",
         f"Время постинга: 🕒 {SCHEDULE['hh']:02d}:{SCHEDULE['mm']:02d} {config.TZ_NAME}",
+        f"В очереди на публикацию: {store.pending_publish_count()}",
         f"Источников: {len(SOURCES)} · "
         f"категорий: {len(config.CATEGORIES)} · ключевых слов: {len(config.KEYWORDS)}",
     ]
@@ -868,17 +869,28 @@ async def apply_keywords_edit(event, uid: int, text: str):
 _MESSAGE_LIMIT = 4096
 
 
-async def _send_post(target, media: list, text_html: str, schedule=None) -> None:
+async def _send_post(target, media: list, text_html: str) -> None:
+    """Send immediately. Bots cannot use Telegram's native schedule=."""
     if not media:
-        await bot.send_message(target, text_html, schedule=schedule)
+        await bot.send_message(target, text_html)
         return
 
     file = media if len(media) > 1 else media[0]
     try:
-        await bot.send_file(target, file=file, caption=text_html, schedule=schedule)
+        await bot.send_file(target, file=file, caption=text_html)
     except MediaCaptionTooLongError:
-        await bot.send_file(target, file=file, schedule=schedule)
-        await bot.send_message(target, text_html, schedule=schedule)
+        await bot.send_file(target, file=file)
+        await bot.send_message(target, text_html)
+
+
+async def _resolve_media(media_path: str | None, media_url: str | None) -> list:
+    if media_path and os.path.exists(media_path):
+        return [media_path]
+    if media_url:
+        raw = await _download_media(media_url)
+        if raw is not None:
+            return [raw]
+    return []
 
 
 async def _publish(
@@ -887,6 +899,7 @@ async def _publish(
     schedule_hh: int | None = None,
     schedule_mm: int | None = None,
 ) -> bool:
+    """Queue a post for local delayed send (bots cannot schedule via Telegram API)."""
     channel = target["channel_id"]
     raw_html = mapping.get("text_html") or ""
 
@@ -908,41 +921,84 @@ async def _publish(
     footer = "\n".join(footer_parts)
     final_text = f"{body}\n\n{footer}".strip() if footer else body
 
-    media: list = []
+    media_path: str | None = None
+    media_url: str | None = None
     if target.get("copy_media"):
-        for url in mapping.get("media_urls") or []:
-            raw = await _download_media(url)
-            if raw is not None:
-                media.append(raw)
-                break  # one photo is enough for caption posts
+        urls = mapping.get("media_urls") or []
+        media_url = urls[0] if urls else None
     else:
         cat_image = target["image"]
-        has_cat_image = bool(cat_image) and os.path.exists(cat_image)
-        if cat_image and not has_cat_image:
+        if cat_image and os.path.exists(cat_image):
+            media_path = cat_image
+        elif cat_image:
             log.warning("Category image not found: %s (posting without it)", cat_image)
-        if has_cat_image:
-            media = [cat_image]
-        else:
-            for url in mapping.get("media_urls") or []:
-                raw = await _download_media(url)
-                if raw is not None:
-                    media.append(raw)
-                    break
+        if not media_path:
+            urls = mapping.get("media_urls") or []
+            media_url = urls[0] if urls else None
 
     when = _next_schedule_dt(schedule_hh, schedule_mm)
+    # Store as UTC ISO so comparisons are timezone-safe.
+    due_at = when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     try:
-        await _send_post(channel, media, final_text, schedule=when)
-        log.info("Scheduled for %s", when.strftime("%Y-%m-%d %H:%M"))
+        job_id = store.enqueue_publish(
+            channel=channel,
+            text_html=final_text,
+            due_at_iso=due_at,
+            media_path=media_path,
+            media_url=media_url,
+        )
+        log.info(
+            "Queued publish #%s -> %s at %s %s",
+            job_id, channel, when.strftime("%Y-%m-%d %H:%M"), config.TZ_NAME,
+        )
         return True
     except Exception as exc:  # noqa: BLE001
-        log.error("Failed to publish to channel %s: %s", channel, exc)
-        try:
-            if len(final_text) <= _MESSAGE_LIMIT:
-                await bot.send_message(channel, final_text, schedule=when)
-                return True
-        except Exception as exc2:  # noqa: BLE001
-            log.error("Fallback publish also failed: %s", exc2)
+        log.error("Failed to queue publish to channel %s: %s", channel, exc)
         return False
+
+
+async def _flush_due_publishes() -> None:
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    jobs = store.due_publishes(now_iso)
+    for job in jobs:
+        try:
+            media = await _resolve_media(job["media_path"], job["media_url"])
+            text = job["text_html"]
+            channel = job["channel"]
+            try:
+                target = int(channel)
+            except ValueError:
+                target = channel
+            if len(text) > _MESSAGE_LIMIT and not media:
+                text = text[: _MESSAGE_LIMIT - 1] + "…"
+            await _send_post(target, media, text)
+            store.remove_publish(job["id"])
+            log.info("Published queued job #%s -> %s", job["id"], channel)
+        except Exception as exc:  # noqa: BLE001
+            STATS["errors"] += 1
+            log.error("Queued publish #%s failed: %s", job["id"], exc)
+            _bump_publish_retry(job["id"])
+
+
+def _bump_publish_retry(job_id: int) -> None:
+    """Push failed job 2 minutes forward so we don't spin."""
+    retry = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        store.bump_publish_due(job_id, retry)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not bump retry for job #%s: %s", job_id, exc)
+
+
+async def publish_loop() -> None:
+    log.info("Local publish scheduler started")
+    await asyncio.sleep(3)
+    while True:
+        try:
+            await _flush_due_publishes()
+        except Exception as exc:  # noqa: BLE001
+            STATS["errors"] += 1
+            log.error("Publish loop error: %s", exc)
+        await asyncio.sleep(20)
 
 
 async def _cleanup(preview_id: int, kb_id: int) -> None:
@@ -978,8 +1034,9 @@ async def main():
 
     bot_me = await bot.get_me()
     log.info(
-        "Bot @%s ready | parsing=%s | sources=%s | poll=%ss",
+        "Bot @%s ready | parsing=%s | sources=%s | poll=%ss | queued=%s",
         bot_me.username, STATE["parsing"], len(SOURCES), config.POLL_INTERVAL,
+        store.pending_publish_count(),
     )
     if not config.ADMIN_IDS:
         log.warning("ADMIN_IDS is empty — anyone who opens the bot can control it.")
@@ -988,6 +1045,7 @@ async def main():
         await asyncio.gather(
             bot.run_until_disconnected(),
             poll_loop(),
+            publish_loop(),
         )
     finally:
         await http.aclose()

@@ -50,6 +50,20 @@ class Store:
             )
             """
         )
+        # Local publish queue — bots cannot use Telegram's native schedule.
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS publish_queue (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel     TEXT NOT NULL,
+                text_html   TEXT NOT NULL,
+                media_path  TEXT,
+                media_url   TEXT,
+                due_at      TEXT NOT NULL,
+                created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         self._conn.commit()
 
     def has_seen_any(self, source: str) -> bool:
@@ -151,6 +165,63 @@ class Store:
         with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute("DELETE FROM pending WHERE kb_msg_id = ?", (kb_msg_id,))
             self._conn.commit()
+
+    def enqueue_publish(
+        self,
+        channel: str | int,
+        text_html: str,
+        due_at_iso: str,
+        media_path: str | None = None,
+        media_url: str | None = None,
+    ) -> int:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "INSERT INTO publish_queue "
+                "(channel, text_html, media_path, media_url, due_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(channel), text_html, media_path or None, media_url or None, due_at_iso),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def due_publishes(self, now_iso: str) -> list[dict]:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "SELECT id, channel, text_html, media_path, media_url, due_at "
+                "FROM publish_queue WHERE due_at <= ? ORDER BY due_at, id",
+                (now_iso,),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "id": r[0],
+                "channel": r[1],
+                "text_html": r[2],
+                "media_path": r[3],
+                "media_url": r[4],
+                "due_at": r[5],
+            }
+            for r in rows
+        ]
+
+    def remove_publish(self, job_id: int) -> None:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute("DELETE FROM publish_queue WHERE id = ?", (job_id,))
+            self._conn.commit()
+
+    def bump_publish_due(self, job_id: int, due_at_iso: str) -> None:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "UPDATE publish_queue SET due_at = ? WHERE id = ?",
+                (due_at_iso, job_id),
+            )
+            self._conn.commit()
+
+    def pending_publish_count(self) -> int:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute("SELECT COUNT(*) FROM publish_queue")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
 
     def close(self) -> None:
         self._conn.close()
