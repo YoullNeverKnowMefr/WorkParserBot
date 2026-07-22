@@ -161,6 +161,15 @@ class Store:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def update_text(self, kb_msg_id: int, text_html: str) -> bool:
+        with self._lock, closing(self._conn.cursor()) as cur:
+            cur.execute(
+                "UPDATE pending SET text_html = ? WHERE kb_msg_id = ?",
+                (text_html, kb_msg_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def remove(self, kb_msg_id: int) -> None:
         with self._lock, closing(self._conn.cursor()) as cur:
             cur.execute("DELETE FROM pending WHERE kb_msg_id = ?", (kb_msg_id,))

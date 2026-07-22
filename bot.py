@@ -425,6 +425,10 @@ def _time_data(path: list[int]) -> bytes:
     return b"time" if not path else ("time:" + ":".join(map(str, path))).encode()
 
 
+def _edit_data(path: list[int]) -> bytes:
+    return b"edit" if not path else ("edit:" + ":".join(map(str, path))).encode()
+
+
 def _time_hour_keyboard() -> list:
     hours = [Button.inline(f"{h:02d}", data=f"th:{h}".encode()) for h in range(24)]
     rows = _grid(hours, per_row=6)
@@ -452,9 +456,10 @@ def nav_keyboard(path: list[int], schedule_hh: int | None = None, schedule_mm: i
         for i, c in enumerate(children)
     ]
     rows = _grid(btns)
-    rows.append([Button.inline(
-        _time_button_label(schedule_hh, schedule_mm), data=_time_data(path),
-    )])
+    rows.append([
+        Button.inline(_time_button_label(schedule_hh, schedule_mm), data=_time_data(path)),
+        Button.inline("✏️ Текст", data=_edit_data(path)),
+    ])
     nav = []
     if path:
         nav.append(Button.inline("⬅️ Назад", data=_path_data(path[:-1]).encode()))
@@ -463,18 +468,25 @@ def nav_keyboard(path: list[int], schedule_hh: int | None = None, schedule_mm: i
     return title, rows
 
 
+def _preview_text(source: str, source_link: str, body_html: str, *, edited: bool = False) -> str:
+    header = (
+        f"📥 <b>@{html.escape(source)}</b> · "
+        f"<a href=\"{html.escape(source_link or '#', quote=True)}\">оригинал</a>"
+    )
+    if edited:
+        header += " · ✏️ <i>отредактировано</i>"
+    preview = f"{header}\n\n{body_html or '<i>(без текста)</i>'}"
+    if len(preview) > 4000:
+        preview = preview[:3990] + "…"
+    return preview
+
+
 # ===========================================================================
 # Scraper poller
 # ===========================================================================
 async def _send_to_moderation(post: ScrapedPost) -> None:
-    header = (
-        f"📥 <b>@{html.escape(post.username)}</b> · "
-        f"<a href=\"{html.escape(post.link, quote=True)}\">оригинал</a>\n\n"
-    )
     body = post.text_html or html.escape(post.text_plain) or "<i>(без текста)</i>"
-    preview = header + body
-    if len(preview) > 4000:
-        preview = preview[:3990] + "…"
+    preview = _preview_text(post.username, post.link, body)
 
     try:
         if post.media_urls and http is not None:
@@ -606,7 +618,7 @@ async def poll_loop() -> None:
 # ===========================================================================
 # Bot: moderation category buttons
 # ===========================================================================
-@bot.on(events.CallbackQuery(pattern=rb"(timecancel|thback|th:|tm:|time|skip|p)"))
+@bot.on(events.CallbackQuery(pattern=rb"(timecancel|thback|th:|tm:|time|editcancel|edit|skip|p)"))
 async def on_category(event: events.CallbackQuery.Event):
     if config.MODERATOR_IDS and event.sender_id not in config.MODERATOR_IDS:
         await event.answer("Нет прав для модерации.", alert=True)
@@ -614,6 +626,13 @@ async def on_category(event: events.CallbackQuery.Event):
 
     data = event.data.decode()
     uid = event.sender_id
+
+    if data == "editcancel":
+        cancelled = await _cancel_post_edit(uid)
+        if not cancelled and store.get(event.message_id):
+            await _restore_moderation_keyboard(event.message_id, [])
+        await event.answer("Редактирование отменено.")
+        return
 
     if data == "timecancel":
         cancelled = await _cancel_post_schedule(uid)
@@ -697,6 +716,26 @@ async def on_category(event: events.CallbackQuery.Event):
         await _cleanup(preview_id, event.message_id)
         await event.answer("Пропущено.")
         log.info("Skipped candidate %s/%s", source, source_msg_id)
+        return
+
+    if data == "edit" or data.startswith("edit:"):
+        path = [int(x) for x in data.split(":")[1:]] if ":" in data else []
+        PENDING[uid] = {
+            "action": "edit_post",
+            "kb_msg_id": event.message_id,
+            "path": path,
+        }
+        try:
+            await event.edit(
+                "✏️ <b>Редактирование поста</b>\n\n"
+                "Отправьте новый текст следующим сообщением в эту группу.\n"
+                "Можно обычный текст (переносы строк сохранятся).\n\n"
+                "После отправки превью обновится.",
+                buttons=[[Button.inline("❌ Отмена", data=b"editcancel")]],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        await event.answer("Жду новый текст…")
         return
 
     if data == "time" or data.startswith("time:"):
@@ -809,6 +848,93 @@ async def _apply_post_schedule(uid: int, hh: int, mm: int) -> bool:
     await _restore_moderation_keyboard(kb_msg_id, path)
     log.info("Post %s schedule set to %02d:%02d by %s", kb_msg_id, hh, mm, uid)
     return True
+
+
+async def _cancel_post_edit(uid: int) -> bool:
+    pending = PENDING.pop(uid, None)
+    if not pending or pending.get("action") != "edit_post":
+        return False
+    kb_msg_id = pending.get("kb_msg_id")
+    path = pending.get("path") or []
+    if kb_msg_id:
+        await _restore_moderation_keyboard(kb_msg_id, path)
+    return True
+
+
+def _text_to_html(raw: str) -> str:
+    """Escape user-provided plain text for HTML parse_mode, keep line breaks."""
+    return html.escape(raw.strip())
+
+
+async def _update_preview_message(mapping: dict, body_html: str) -> None:
+    preview = _preview_text(
+        mapping["source"],
+        mapping.get("source_link") or "",
+        body_html,
+        edited=True,
+    )
+    try:
+        await bot.edit_message(
+            config.MODERATION_GROUP,
+            mapping["preview_msg_id"],
+            preview,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not update preview message: %s", exc)
+
+
+async def _apply_post_edit(uid: int, raw_text: str) -> bool:
+    pending = PENDING.get(uid) or {}
+    if pending.get("action") != "edit_post":
+        return False
+    kb_msg_id = pending.get("kb_msg_id")
+    path = pending.get("path") or []
+    mapping = store.get(kb_msg_id) if kb_msg_id else None
+    if not kb_msg_id or not mapping:
+        PENDING.pop(uid, None)
+        return False
+    body_html = _text_to_html(raw_text)
+    if not body_html:
+        return False
+    store.update_text(kb_msg_id, body_html)
+    await _update_preview_message(mapping, body_html)
+    PENDING.pop(uid, None)
+    await _restore_moderation_keyboard(kb_msg_id, path)
+    log.info("Post %s text edited by %s (%d chars)", kb_msg_id, uid, len(body_html))
+    return True
+
+
+@bot.on(events.NewMessage(chats=config.MODERATION_GROUP))
+async def on_moderation_text(event: events.NewMessage.Event):
+    """Accept replacement post text while a moderator is in edit_post flow."""
+    if event.out:
+        return
+    uid = event.sender_id
+    if config.MODERATOR_IDS and uid not in config.MODERATOR_IDS:
+        return
+    pending = PENDING.get(uid)
+    if not pending or pending.get("action") != "edit_post":
+        return
+
+    text = (event.raw_text or "").strip()
+    if text == "/cancel":
+        await _cancel_post_edit(uid)
+        try:
+            await event.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if not text or text.startswith("/"):
+        return
+
+    ok = await _apply_post_edit(uid, text)
+    try:
+        await event.delete()
+    except Exception:  # noqa: BLE001
+        pass
+    if not ok:
+        await event.respond("Не удалось сохранить текст. Нажмите ✏️ Текст ещё раз.")
+        return
 
 
 # ===========================================================================
